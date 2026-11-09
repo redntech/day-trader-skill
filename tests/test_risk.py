@@ -386,8 +386,11 @@ class V1Checks(unittest.TestCase):
         r = self.one(opt)
         self.assertEqual(r["verdict"], "BLOCK")
         self.assertIn("option", " ".join(r["reasons"]))
+        # allowed, but an option still has to fit the loss limit (the whole premium) and carry its quote
         r = self.one(opt, allow_options=True)
-        self.assertEqual(r["verdict"], "PASS")
+        self.assertEqual(r["verdict"], "BLOCK")
+        text = " ".join(r["reasons"])
+        self.assertIn("bid and ask", text)
         self.assertTrue(r["warnings"])
 
     def test_crypto_and_junk_symbols(self):
@@ -458,6 +461,38 @@ class V1Checks(unittest.TestCase):
     def test_live_account_warns(self):
         res = check.check([buy("KO", 100)], v1(paper=False), today=V1_TODAY)
         self.assertIn("LIVE", res["warnings"][0])
+
+
+class ClosedOptionLosses(unittest.TestCase):
+    """A bought option that is sold again counts only its realized loss in the daily loss."""
+    P = "SPXW261109P07510000"
+    C = "SPXW261109C07590000"
+
+    @staticmethod
+    def fill(sym, side, qty, price, day=TODAY):
+        return {"status": "filled", "date": day, "symbol": sym, "side": side, "qty": str(qty), "price": price}
+
+    def test_loser_counts_realized_loss_winner_counts_zero(self):
+        state = {"orders": [self.fill(self.P, "buy", 1, 1.95), self.fill(self.P, "sell", 1, 1.25),
+                            self.fill(self.C, "buy", 1, 1.75), self.fill(self.C, "sell", 1, 2.30)]}
+        self.assertEqual(check.closed_option_losses(state, TODAY), {self.P: 70.0, self.C: 0.0})
+
+    def test_open_or_partly_sold_option_is_not_closed(self):
+        state = {"orders": [self.fill(self.P, "buy", 2, 1.00), self.fill(self.P, "sell", 1, 0.50),
+                            self.fill(self.C, "buy", 1, 1.75)]}
+        self.assertEqual(check.closed_option_losses(state, TODAY), {})
+
+    def test_other_days_and_stocks_are_ignored(self):
+        state = {"orders": [self.fill(self.P, "buy", 1, 1.95, day="2026-10-16"),
+                            self.fill(self.P, "sell", 1, 1.25, day="2026-10-16"),
+                            self.fill("TSLA", "buy", 1, 300.0), self.fill("TSLA", "sell", 1, 290.0)]}
+        self.assertEqual(check.closed_option_losses(state, TODAY), {})
+
+    def test_daily_loss_uses_realized_not_premium(self):
+        entry = placed(self.P, max_loss=195.0, kind="entry")
+        state = {"orders": [entry, self.fill(self.P, "buy", 1, 1.95), self.fill(self.P, "sell", 1, 1.25)]}
+        res = check.check([buy("KO", 100)], cfg(max_daily_loss_usd=500), state=state, today=TODAY, now=at(NOW))
+        self.assertEqual(res["today"]["loss_at_risk"], 70.0)
 
 
 class Cli(unittest.TestCase):

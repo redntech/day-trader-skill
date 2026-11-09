@@ -57,7 +57,8 @@ If `trader/config.json` does not exist, copy `config.example.json` into
 - **max_loss_per_trade_usd**: the most one trade may lose if the stop fills at the stop (default 50).
 - **max_position_pct**, **max_order_usd**, **min_order_usd**: the biggest position (75% of the
   budget), the biggest order ($4,000) and the smallest order ($5).
-- The day limits trader-risk enforces: **max_daily_loss_usd** (150), **max_trades_per_day** (3),
+- The day limits trader-risk enforces (example-config defaults; trader/config.json may differ):
+  **max_daily_loss_usd** (150), **max_trades_per_day** (3),
   **min_reward_risk** (1.0), **require_stop** (true), **no_entries_before** / **no_entries_after**
   ("09:45" / "15:30") and **flat_by** ("15:55"), all New York time.
 - **blocked**: tickers they never want to trade.
@@ -148,11 +149,29 @@ a separate config (`--config`) for a long-term split.
 - No projections: never say what a trade will make. A target is a plan, not a forecast.
 - Free Yahoo prices are unofficial and can lag. The broker's price is the one that fills.
 
+## Options (long calls and puts only)
+
+Off in the example config (`"allow_options": false`). When the user turns it on, `options.py` sizes ONE bought option to
+the max loss. An option has no stop: the most it can lose is the premium, so the size is
+`floor(max_loss_per_trade_usd / (limit price x 100))`, also capped by max order, position cap and cash.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/options.py" --symbol CRWD261120C00225000 --bid 0.40 --ask 0.42 --open-interest 900
+python3 "${CLAUDE_SKILL_DIR}/options.py" --symbol CRWD261120C00225000 --bid 0.40 --ask 0.42 --open-interest 900 --write
+```
+
+- The quote comes from Alpaca's options-data tools (`get_option_chain`, `get_option_latest_quote`): needs
+  `options-data` in `ALPACA_TOOLSETS`. Pass the real bid, ask and open interest; never guess them.
+- It buys with a limit order at the ask, good for today. A spread over `max_option_spread_pct` (10), open interest
+  under `min_option_open_interest` (100) or an expiry under `min_option_dte_days` (1; set 0 for same-day 0DTE options) is a refusal.
+- One contract that costs more than the max loss is a plain refusal, not a smaller order.
+- It writes a `place_option_order` shape to `trader/orders.json`. Nothing is placed.
+
 ## What it never does
 
 It never places, approves or schedules an order, never raises a limit on its
-own, never shrinks a stop to fit more shares, and never sizes options,
-margin or short positions.
+own, never shrinks a stop to fit more shares, and never sizes margin, short
+positions or sold options. The only option it sizes is one bought call or put (options.py).
 
 ## Safety
 

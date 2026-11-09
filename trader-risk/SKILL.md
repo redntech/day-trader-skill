@@ -154,6 +154,18 @@ it is after the 3:30 entry cutoff: it is an exit.
 - Free Yahoo prices are unofficial and can lag; the broker's price is the one that fills, and a
   stop can fill worse than its price in a fast market.
 
+## Options
+
+With `"allow_options": true`, a bought option (`buy_to_open`, limit order, day, whole contracts) is checked like
+an entry, with these differences: the max loss is the whole premium (limit x 100 x contracts) and must fit
+`max_loss_per_trade_usd`; there is no stop or reward:risk check (Alpaca takes no stop on an option); the quote's
+bid and ask in the order's `plan` must show a spread under `max_option_spread_pct` (10), open interest at least
+`min_option_open_interest` (100), and the expiry at least `min_option_dte_days` (1; 0 allows 0DTE) away. Brackets, multi-leg
+orders, market orders, gtc and selling to open are blocked. A sell must say `"position_intent": "sell_to_close"`
+and a buy may only be `buy_to_open`, so a stale portfolio file can never open a short option. The premium counts in the daily loss and the trades
+a day. Once the fill log shows an option bought and sold again today in equal amounts, only its realized
+loss counts (a winner counts 0), and buying that contract again is not a duplicate. A sell that closes contracts you hold is an exit and is never blocked by the day limits.
+
 ## What it never does
 
 It never places an order, never edits an order to make it pass, never

@@ -11,7 +11,9 @@ description: >-
   Budget Manager and Price Alerts. Long side only. Use when the user says
   "where's my stop", "set my stop and target", "plan the exit", "when do I get
   out", "stop loss", "what's my R", "risk reward", or right after
-  /trader-entry triggers, before /trader-timemachine.
+  /trader-entry triggers, before /trader-timemachine. Also holds the SPY 0DTE
+  options loop (scalp/tick.py, one tick a minute on paper) and its backtest:
+  use for "run the SPY options loop", "0DTE", "backtest the scalp rules".
 argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
 ---
 
@@ -114,6 +116,20 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 - Nothing here promises winning trades or money. A 1R target is not a
   prediction that the price gets there.
 - Long side only. v2 plans longs only.
+
+## SPY 0DTE options loop and its backtest
+
+Separate from the stop-and-target planner above, and paper only:
+
+- `backtest/` replays option rules on 1-minute bars (`fetch.py` downloads them with the paper keys, read in
+  memory and never printed; `backtest.py` and `sweep.py` replay them). Quick scalps lost money in every version
+  tested (`spxw-scalp-rules.md`). One slower rule set held up out of sample, and it is not proven:
+  `spy-morning-momentum.md` (variant `spy-am`). These tools print backtest P/L. That is a replay, not a promise.
+- `scalp/tick.py` runs that rule set one tick at a time and prints one action. It never places an order. Every
+  order still goes through trader-budget (`options.py`), trader-risk and trader-broker. Follow
+  `scalp/loop.md` to the letter, including the user's standing yes for the day (`ticket.py authorize`).
+- Buy to open calls or puts, sell to close. Never margin, shorting, writing options or spreads. No scalp is held
+  past 15:30 ET.
 
 ## What it never does
 
