@@ -80,7 +80,7 @@ against its source on 2026-10-20 (version 2.4.0).
         "ALPACA_API_KEY": "paste your paper key here, in this file only",
         "ALPACA_SECRET_KEY": "paste your paper secret here, in this file only",
         "ALPACA_PAPER_TRADE": "true",
-        "ALPACA_TOOLSETS": "account,trading,stock-data"
+        "ALPACA_TOOLSETS": "account,trading,stock-data,options-data"
       }
     }
   }
@@ -101,10 +101,12 @@ against its source on 2026-10-20 (version 2.4.0).
    - every other tool that places, changes, cancels or closes anything
      (`cancel_order_by_id`, `replace_order_by_id`, `close_position`,
      `update_account_config`): Needs approval.
-   - `place_option_order`, `place_crypto_order`, `close_all_positions`,
-     `cancel_all_orders`, `exercise_options_position`,
-     `do_not_exercise_options_position`: **Blocked** unless the user has a
-     reason and says so.
+   - `place_option_order`: **Blocked** while `"allow_options"` is false. With
+     options on: Needs approval. A loop that runs on a standing yes stalls on
+     that card; whether to allow it is the user's own setting, never Claude's.
+   - `place_crypto_order`, `close_all_positions`, `cancel_all_orders`,
+     `exercise_options_position`, `do_not_exercise_options_position`:
+     **Blocked** unless the user has a reason and says so.
    - read-only tools (`get_account_info`, `get_all_positions`, `get_open_position`,
      `get_orders`, `get_clock`, `get_stock_snapshot`, `get_stock_latest_quote`):
      Always allow is fine.
@@ -191,10 +193,42 @@ card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
 
+## Options
+
+An option ticket shows the contract in words, the limit price and the max loss (the whole premium), and the exact JSON
+for `place_option_order`. The same three gates apply: a risk PASS, the user's typed yes for that one order, and
+the Allow once card (keep `place_option_order` on "Needs approval", never Always allow). There is no stop at the
+broker, so the open option is watched and closed by hand: `ticket.py flatten --symbol OCC --qty N --limit BID`
+builds a `sell_to_close` limit ticket at the current bid (`get_option_latest_quote`), which then goes through
+trader-risk and the user's yes like any order. Fills are recorded with the 100x contract multiplier.
+trader-risk blocks an option sell without `"position_intent": "sell_to_close"`, so a stale portfolio can never
+turn into a written option.
+
+## Standing yes (paper option loops only)
+
+A loop that ticks every minute cannot ask for a yes each time. The user can give ONE standing yes for the
+day, with bounds they see first:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" authorize --reply "<the user's words>" --underlying SPY --until 11:30 --max-orders 12 --max-loss-usd 400
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" approve --index 1 --standing
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" revoke
+```
+
+- `authorize` takes only the user's own reply starting with "yes", with no question or condition in it.
+  It refuses a live account, options turned off, an end time after `flat_by`, more orders than
+  `max_orders_per_day`, or more premium than `max_daily_loss_usd`. It lasts until `--until` that day.
+- `approve --standing` still needs trader-risk to PASS that exact order. It accepts only a single-leg limit
+  option order on a named underlying: `buy_to_open` or `sell_to_close`, within the order count and the total
+  premium. Anything else (a stock, another underlying, `sell_to_open`, a market order) needs its own yes.
+- The user says stop: `revoke` at once. Each record in `trader/state/broker.json` says whether a standing yes
+  or a typed yes approved it.
+
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.
-- Never places orders from a scheduled or background task: nobody is there to say yes.
+- Never places orders from a scheduled or background task, except paper option orders covered by a standing
+  yes the user gave that day (`ticket.py authorize`). Everything else waits for the user.
 - Never asks for, reads, stores or repeats API keys or passwords.
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
@@ -208,5 +242,7 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
   passed that exact order today, the user typed an explicit yes for that one order in the chat, and the
   user clicked Allow once on Claude's own card because the order tool is set to "Needs approval"
   (Customize > Connectors > tool permissions). Never set an order tool to "Always allow".
-- No options, margin, short selling or leverage unless the config allows it and the user confirms.
+- Never margin, short selling, writing (selling to open) options, spreads, multi-leg orders or any leverage.
+  Long calls and puts (buy to open, sell to close) only with `"allow_options": true`. The worst case is
+  the premium paid.
 - Broker keys live in environment variables or the Claude Desktop config, never in the chat.

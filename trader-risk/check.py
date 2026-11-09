@@ -45,7 +45,8 @@ What blocks an entry (on top):
                 cannot understate the risk
   reward:risk   (target - entry) / (entry - stop) under min_reward_risk
   daily loss    the max losses at the stops of today's entries plus this one
-                over max_daily_loss_usd (win or lose, each counts in full)
+                over max_daily_loss_usd (each counts in full; an option bought and fully
+                sold again today counts only its realized loss, a winner 0)
   trades        max_trades_per_day entries already placed today
   window        before no_entries_before or after no_entries_after (New York
                 time), or the market is closed (weekend, NYSE holiday, outside
@@ -74,16 +75,19 @@ DEFAULTS = {
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
     "pdt_guard": False,
+    "max_option_spread_pct": 10, "min_option_open_interest": 100, "min_option_dte_days": 1,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
-                 "stop_loss_limit_price", "advanced_instructions")
+                 "stop_loss_limit_price", "advanced_instructions", "position_intent")
 PRICE_FIELDS = ("qty", "notional", "limit_price", "stop_price", "take_profit_limit_price",
                 "stop_loss_stop_price", "stop_loss_limit_price")
 TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIFS = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+OCC_PARTS = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+OPTION_MULT = 100
 TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
@@ -318,7 +322,7 @@ def account(cfg, portfolio, prices):
             n = sum(_f(l.get("shares")) or 0 for l in p.get("lots", []))
         shares[t] = shares.get(t, 0) + n
         if prices.get(t):
-            values[t] = shares[t] * prices[t]
+            values[t] = shares[t] * prices[t] * (OPTION_MULT if OCC.match(t) else 1)
         else:
             basis = sum(_f(l.get("cost")) or 0 for l in p.get("lots", []))
             values[t] = basis
@@ -344,6 +348,33 @@ def placed_today(state, today):
     for rec in (state or {}).get("orders", []):
         if rec.get("status") == "placed" and rec_day(rec) == today:
             out.append(rec)
+    return out
+
+
+def closed_option_losses(state, today):
+    """{OCC symbol: realized loss in dollars} for options bought AND fully sold again today,
+    from the fills trader-broker logged. A winner is 0. An option still open (or only partly
+    sold) is not here: its full premium stays counted as the worst case."""
+    pool = {}
+    for rec in (state or {}).get("orders", []):
+        if rec.get("status") != "filled" or rec_day(rec) != today:
+            continue
+        sym = str(rec.get("symbol", "")).upper()
+        if not OCC.match(sym.replace(" ", "")):
+            continue
+        q, p = _f(rec.get("qty")), _f(rec.get("price"))
+        if q is None or p is None:
+            continue
+        d = pool.setdefault(sym, {"buy_q": 0.0, "buy_usd": 0.0, "sell_q": 0.0, "sell_usd": 0.0})
+        side = "buy" if str(rec.get("side", "")).lower() == "buy" else "sell"
+        d[side + "_q"] += q
+        d[side + "_usd"] += q * p * OPTION_MULT
+    out = {}
+    for sym, d in pool.items():
+        # exactly matched only: selling more than today's buys means older lots are mixed in, so the
+        # realized figure would be wrong; keep the full premium counted instead (conservative)
+        if d["buy_q"] > 0 and abs(d["sell_q"] - d["buy_q"]) < 1e-9:
+            out[sym] = round(max(0.0, d["buy_usd"] - d["sell_usd"]), 2)
     return out
 
 
@@ -387,7 +418,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     count_today = len(done_today)
     entries_today = [r for r in done_today if rec_is_entry(r)]
     loss_today = 0.0
+    closed_opts = closed_option_losses(state, today)
+    counted_closed = set()
     for r in entries_today:
+        rsym = str(r.get("symbol", "")).upper()
+        if rsym in closed_opts:
+            # a bought option that is fully sold again: only the realized loss counts (a win counts 0)
+            if rsym not in counted_closed:
+                loss_today += closed_opts[rsym]
+                counted_closed.add(rsym)
+            continue
         ml = _f(r.get("max_loss"))
         if ml is None:
             top_warn.append("an entry placed today (%s %s) has no max loss in the log; not counted in "
@@ -428,6 +468,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         legs = o.get("take_profit_limit_price") is not None or o.get("stop_loss_stop_price") is not None
         bracket = oc == "bracket" or (not oc and legs)
         value = None
+        is_opt = bool(sym and OCC.match(sym.replace(" ", "")))
+        mult = OPTION_MULT if is_opt else 1
 
         # format
         if not sym:
@@ -458,6 +500,27 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: extended hours needs a limit order with time_in_force day or gtc")
         if o.get("stop_loss_limit_price") is not None and o.get("stop_loss_stop_price") is None:
             reasons.append("format: stop_loss_limit_price needs a stop_loss_stop_price")
+        if is_opt and c.get("allow_options"):
+            if bracket or oc or o.get("advanced_instructions") or o.get("legs"):
+                reasons.append("option: single-leg orders only; no bracket, multi-leg or advanced orders "
+                               "(Alpaca takes no stop-loss on options: the premium is the max loss)")
+            if notional is not None:
+                reasons.append("option: order whole contracts (qty), not a dollar amount")
+            elif _f(qty) is not None and abs(_f(qty) - round(_f(qty))) > 1e-9:
+                reasons.append("option: whole contracts only, got qty %r" % qty)
+            if side == "buy" and (typ != "limit" or o.get("limit_price") is None):
+                reasons.append("option: buy with a limit order at or near the ask; a market order on an "
+                               "option can fill far from the quote")
+            if side == "buy" and tif != "day":
+                reasons.append("option: buy with time_in_force day, so nothing stays open overnight")
+            intent = str(o.get("position_intent") or "").strip().lower()
+            if side == "sell" and intent != "sell_to_close":
+                # without sell_to_close, a stale portfolio.json could let Alpaca open a short (written) option
+                reasons.append("option: a sell must say position_intent \"sell_to_close\" (got %r); this pack "
+                               "never sells to open" % (o.get("position_intent") or None))
+            if side == "buy" and intent not in ("", "buy_to_open"):
+                reasons.append("option: a buy must be buy_to_open (got %r); this pack never holds a short "
+                               "option to buy back" % o.get("position_intent"))
         if bracket:
             if notional is not None:
                 reasons.append("format: a bracket order needs a whole-share qty, not a notional amount")
@@ -478,7 +541,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
             else:
-                warns.append("option order: options can lose 100%% of what you pay")
+                warns.append("option order: options can lose 100% of what you pay")
         elif sym and ("/" in sym or not TICKER.match(sym)):
             reasons.append("asset: %s does not look like a US stock or ETF ticker; "
                            "this pack trades stocks and ETFs only" % sym)
@@ -509,7 +572,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             value = _f(notional)
         elif q:
             if ref:
-                value = q * ref
+                value = q * ref * mult
 
         # entry or exit
         held = acct["shares"].get(sym, 0.0)
@@ -564,8 +627,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             else:
                 over = held <= 0
             if over and not c.get("allow_short"):
-                reasons.append("short: selling more %s than you hold (%s shares); short selling is off. "
-                               "If you bought it, record the fill first (ticket.py fill)" % (sym, _num(held)))
+                reasons.append("short: selling more %s than you hold (%s %s); short selling is off. "
+                               "If you bought it, record the fill first (ticket.py fill)"
+                               % (sym, _num(held), "contracts" if is_opt else "shares"))
 
         # day-trade checks: stop, loss, reward:risk, daily loss, trades, window, pdt
         max_loss = risk_ps = rr = stop = target = None
@@ -580,7 +644,64 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if stop and not leg_stop:
                 warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
                              "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
-            if not stop:
+            if is_opt:
+                if not c.get("allow_options"):
+                    pass            # already blocked in the asset check
+                elif not long:
+                    later.append("option: selling to open is off; this pack buys options and sells them "
+                                 "to close")
+                elif not ref or q is None:
+                    later.append("option: needs a quantity and a limit price to measure the loss")
+                else:
+                    max_loss = round(q * ref * OPTION_MULT, 2)
+                    risk_ps = round(ref * OPTION_MULT, 2)
+                    cap = _f(c.get("max_loss_per_trade_usd"))
+                    if cap and max_loss > cap + CENT:
+                        later.append("loss: %s contract%s x %s x 100 = %s premium, all of it at risk, over your "
+                                     "%s max loss per trade" % (_num(q), "" if q == 1 else "s", _p(ref),
+                                                                money(max_loss), money(cap)))
+                    m = OCC_PARTS.match(sym.replace(" ", ""))
+                    try:
+                        expiry = datetime.date(2000 + int(m.group(2)), int(m.group(3)), int(m.group(4)))
+                    except ValueError:
+                        expiry = None
+                        later.append("option: %s has an impossible expiry date" % sym)
+                    if expiry:
+                        dte = (expiry - datetime.date.fromisoformat(today)).days
+                        min_dte = int(c.get("min_option_dte_days") or 0)
+                        if dte < min_dte:
+                            later.append("option: expires %s, %d day%s away; at least %d day%s out is "
+                                         "required (\"min_option_dte_days\")" % (expiry.isoformat(), dte,
+                                                                              "" if dte == 1 else "s", min_dte,
+                                                                              "" if min_dte == 1 else "s"))
+                    bid, ask = _f(plan.get("bid")), _f(plan.get("ask"))
+                    if not bid or not ask or ask < bid:
+                        later.append("option: the plan needs the quote's bid and ask to check the spread "
+                                     "(trader-budget options.py writes them)")
+                    else:
+                        mid = (bid + ask) / 2.0
+                        spread = 100.0 * (ask - bid) / mid
+                        max_sp = _f(c.get("max_option_spread_pct"))
+                        if max_sp and spread > max_sp + 1e-9:
+                            later.append("liquidity: bid %s ask %s is a %.1f%% spread, over your %s%% limit"
+                                         % (_p(bid), _p(ask), spread, _num(max_sp)))
+                        if ref > ask + CENT:
+                            later.append("price: the limit %s is above the ask %s; you would overpay"
+                                         % (_p(ref), _p(ask)))
+                        info.append("option bid %s ask %s, spread %.1f%%" % (_p(bid), _p(ask), spread))
+                    oi = _f(plan.get("open_interest"))
+                    min_oi = _f(c.get("min_option_open_interest"))
+                    if min_oi:
+                        if oi is None:
+                            later.append("liquidity: the plan needs the contract's open interest")
+                        elif oi < min_oi:
+                            later.append("liquidity: open interest %s is under your minimum %s"
+                                         % (_num(oi), _num(min_oi)))
+                    info.append("max loss %s = the whole premium (%s x %s x 100)%s; no broker stop on an option"
+                                % (money(max_loss), _num(q), _p(ref),
+                                   (", limit %s" % money(c["max_loss_per_trade_usd"]))
+                                   if _f(c.get("max_loss_per_trade_usd")) else ""))
+            elif not stop:
                 if c.get("require_stop", True):
                     later.append("stop: no stop. Every entry needs one (\"require_stop\": true): a bracket "
                                  "stop_loss_stop_price, from trader-exit and trader-budget")
@@ -646,7 +767,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         key = (sym, side)
         if key in seen:
             later.append("duplicate: a second %s %s in this batch" % (side, sym))
-        if key in placed_keys:
+        if key in placed_keys and not (is_opt and side == "buy" and sym in closed_opts):
+            # an option bought and fully sold again today (per the fill log) may be bought again
             later.append("duplicate: a %s %s was already placed today" % (side, sym))
         passed_so_far = sum(1 for r in results if r["verdict"] == "PASS")
         cap_n = int(c.get("max_orders_per_day") or 0)
@@ -672,7 +794,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 if q is not None:
                     acct["shares"][sym] = held + q
                 elif ref and value is not None:
-                    acct["shares"][sym] = held + value / ref
+                    acct["shares"][sym] = held + value / (ref * mult)
             elif side == "sell":
                 if value is not None:
                     acct["cash"] += value
@@ -680,10 +802,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 if q is not None:
                     acct["shares"][sym] = held - q
                 elif ref and value is not None:
-                    acct["shares"][sym] = held - value / ref
+                    acct["shares"][sym] = held - value / (ref * mult)
         results.append({
             "index": i, "symbol": sym, "side": side, "kind": kind,
-            "amount": money(_f(notional) or 0) if notional is not None else ("%s shares" % qty),
+            "amount": money(_f(notional) or 0) if notional is not None else
+                      ("%s contract%s" % (qty, "" if _f(qty) == 1 else "s") if is_opt else "%s shares" % qty),
             "value_usd": round(value, 2) if value is not None else None,
             "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
